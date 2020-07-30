@@ -1,67 +1,74 @@
 """Plugin that automatically bans according to a blacklist"""
 import asyncio
-import datetime
 import itertools
 import logging
-import os
-import uuid
-from typing import Dict
 
 import logzero
+from PIL import UnidentifiedImageError
+from photohash import hashes_are_similar
 from pyArango.theExceptions import DocumentNotFoundError
 from telethon import events
 from telethon.events import ChatAction, NewMessage
 from telethon.tl.custom import Message
 from telethon.tl.custom import MessageButton
-from telethon.tl.functions.channels import EditBannedRequest, DeleteUserHistoryRequest
+from telethon.tl.functions.channels import DeleteUserHistoryRequest, GetParticipantRequest
 from telethon.tl.functions.users import GetFullUserRequest
-from telethon.tl.types import (Channel, ChatBannedRights,
-                               MessageEntityTextUrl, UserFull, MessageEntityUrl,
-                               MessageEntityMention, Photo, ChannelParticipantsAdmins)
+from telethon.tl.types import (Channel, MessageEntityTextUrl, UserFull, MessageEntityUrl,
+                               MessageEntityMention, ChannelParticipantsAdmins, ChannelParticipantAdmin)
 
 from database.arango import ArangoDB
 from utils import helpers, constants
-from utils.client import KantekClient
+from utils.client import Client
 from utils.helpers import hash_photo
-from photohash import hashes_are_similar
-
-__version__ = '0.4.1'
+from utils.pluginmgr import k
+from utils.tags import Tags
 
 tlog = logging.getLogger('kantek-channel-log')
 logger: logging.Logger = logzero.logger
 
 
-@events.register(events.MessageEdited(outgoing=False))
-@events.register(events.NewMessage(outgoing=False))
+@k.event(events.MessageEdited(outgoing=False))
+@k.event(events.NewMessage(outgoing=False), name='polizei')
 async def polizei(event: NewMessage.Event) -> None:
-    """Plugin to automatically ban users for certain messages."""
-    client: KantekClient = event.client
+    """Checks every message against the autobahn blacklists and bans a user if necessary
+
+    If the message comes from an admin or a bot it is ignored.
+
+    The user will be banned with a reason that contains the blacklist and the index of the blacklisted item. The message is automatically submitted to the SpamWatch API if applicable.
+
+    Tags:
+        polizei:
+            exclude: Messages won't be checked
+    """
+    if event.is_private:
+        return
+    client: Client = event.client
     chat: Channel = await event.get_chat()
-    db: ArangoDB = client.db
-    chat_document = db.groups.get_chat(event.chat_id)
-    db_named_tags: Dict = chat_document['named_tags'].getStore()
-    bancmd = db_named_tags.get('gbancmd', 'manual')
-    polizei_tag = db_named_tags.get('polizei')
+    tags = Tags(event)
+    bancmd = tags.get('gbancmd', 'manual')
+    polizei_tag = tags.get('polizei')
     if polizei_tag == 'exclude':
         return
     ban_type, ban_reason = await _check_message(event)
     if ban_type and ban_reason:
         uid = event.message.from_id
-        admins = [p.id for p in (await client.get_participants(event.chat_id, filter=ChannelParticipantsAdmins()))]
+        admins = [p.id for p in await client.get_participants(event.chat_id, filter=ChannelParticipantsAdmins())]
         if uid not in admins:
             await _banuser(event, chat, uid, bancmd, ban_type, ban_reason)
 
 
-@events.register(events.chataction.ChatAction())
+@k.event(events.chataction.ChatAction())
 async def join_polizei(event: ChatAction.Event) -> None:
     """Plugin to ban users with blacklisted strings in their bio."""
-    client: KantekClient = event.client
+    # avoid flood waits from chats mass adding users and don't check users leaving
+    if not event.user_joined:
+        return
+    client: Client = event.client
     chat: Channel = await event.get_chat()
     db: ArangoDB = client.db
-    chat_document = db.groups.get_chat(event.chat_id)
-    db_named_tags: Dict = chat_document['named_tags'].getStore()
-    bancmd = db_named_tags.get('gbancmd')
-    polizei_tag = db_named_tags.get('polizei')
+    tags = Tags(event)
+    bancmd = tags.get('gbancmd')
+    polizei_tag = tags.get('polizei')
     if polizei_tag == 'exclude':
         return
     ban_type, ban_reason = False, False
@@ -92,37 +99,32 @@ async def join_polizei(event: ChatAction.Event) -> None:
 
 async def _banuser(event, chat, userid, bancmd, ban_type, ban_reason):
     formatted_reason = f'Spambot[kv2 {ban_type} 0x{ban_reason.rjust(4, "0")}]'
-    client: KantekClient = event.client
+    client: Client = event.client
     db: ArangoDB = client.db
     chat: Channel = await event.get_chat()
     await event.delete()
     try:
         old_ban_reason = db.banlist[userid]['reason']
         if old_ban_reason == formatted_reason:
-            logger.info(f'User ID `{userid}` already banned for the same reason.')
+            logger.info('User ID `%s` already banned for the same reason.', userid)
             return
     except DocumentNotFoundError:
         pass
     if chat.creator or chat.admin_rights:
         if bancmd == 'manual':
-            await client(EditBannedRequest(
-                chat, userid, ChatBannedRights(
-                    until_date=datetime.datetime(2038, 1, 1),
-                    view_messages=True
-                )
-            ))
+            await client.ban(chat, userid)
         elif bancmd is not None:
             await client.respond(event, f'{bancmd} {userid} {formatted_reason}')
             await asyncio.sleep(0.25)
-    await client.gban(userid, formatted_reason)
+    await client.gban(userid, formatted_reason, await helpers.textify_message(event.message))
 
     message_count = len(await client.get_messages(chat, from_user=userid, limit=10))
     if message_count <= 5:
         await client(DeleteUserHistoryRequest(chat, userid))
 
 
-async def _check_message(event):
-    client: KantekClient = event.client
+async def _check_message(event):  # pylint: disable = R0911
+    client: Client = event.client
     msg: Message = event.message
     user_id = msg.from_id
     if user_id is None:
@@ -130,10 +132,16 @@ async def _check_message(event):
     # exclude users below a certain id to avoid banning "legit" users
     if user_id and user_id < 610000000:
         return False, False
+    try:
+        result = await client(GetParticipantRequest(event.chat_id, user_id))
+        if isinstance(result.participant, ChannelParticipantAdmin):
+            return False, False
+    except ValueError:
+        return False, False
 
     # no need to ban bots as they can only be added by users anyway
     user = await client.get_cached_entity(user_id)
-    if user.bot:
+    if user is None or user.bot:
         return False, False
 
     # commands used in bots to blacklist items, these will be used by admins
@@ -141,6 +149,7 @@ async def _check_message(event):
     blacklisting_commands = [
         '/addblacklist',
     ]
+
     for cmd in blacklisting_commands:
         if msg.text and msg.text.startswith(cmd):
             return False, False
@@ -151,6 +160,7 @@ async def _check_message(event):
     domain_blacklist = db.ab_domain_blacklist.get_all()
     file_blacklist = db.ab_file_blacklist.get_all()
     mhash_blacklist = db.ab_mhash_blacklist.get_all()
+    # tld_blacklist = db.ab_tld_blacklist.get_all()
 
     inline_bot = msg.via_bot_id
     if inline_bot is not None and inline_bot in channel_blacklist:
@@ -164,20 +174,28 @@ async def _check_message(event):
                 _, chat_id, _ = await helpers.resolve_invite_link(button.url)
                 if chat_id in channel_blacklist:
                     return db.ab_channel_blacklist.hex_type, channel_blacklist[chat_id]
+
                 domain = await client.resolve_url(button.url)
+
                 if domain in domain_blacklist:
                     return db.ab_domain_blacklist.hex_type, domain_blacklist[domain]
+
+                # tld_index = await _check_tld(domain, tld_blacklist)
+                # if tld_index:
+                #     return db.ab_tld_blacklist.hex_type, tld_index
+
                 face_domain = await helpers.netloc(button.url)
                 if face_domain in domain_blacklist:
                     return db.ab_domain_blacklist.hex_type, domain_blacklist[face_domain]
+
                 elif domain in constants.TELEGRAM_DOMAINS:
                     _entity = await client.get_cached_entity(domain)
                     if _entity and _entity in channel_blacklist:
                         return db.ab_channel_blacklist.hex_type, channel_blacklist[_entity]
 
-    entities = [e for e in msg.get_entities_text()]
-    for entity, text in entities:
-        link_creator, chat_id, random_part = await helpers.resolve_invite_link(text)
+    entities = msg.get_entities_text()
+    for entity, text in entities:  # pylint: disable = R1702
+        _, chat_id, _ = await helpers.resolve_invite_link(text)
         if chat_id in channel_blacklist.keys():
             return db.ab_channel_blacklist.hex_type, channel_blacklist[chat_id]
 
@@ -191,28 +209,58 @@ async def _check_message(event):
             if domain in constants.TELEGRAM_DOMAINS:
                 # remove any query parameters like ?start=
                 # replace @ since some spammers started using it, only Telegram X supports it
-                username = text.split('?')[0].replace('@', '')
+                url = await client.resolve_url(text, base_domain=False)
+                username = url.split('?')[0].replace('@', '')
                 _entity = username
 
         elif isinstance(entity, MessageEntityTextUrl):
             domain = await client.resolve_url(entity.url)
             face_domain = await helpers.netloc(entity.url)
             if domain in constants.TELEGRAM_DOMAINS:
-                username = entity.url.split('?')[0].replace('@', '')
+                url = await client.resolve_url(entity.url, base_domain=False)
+                username = url.split('?')[0].replace('@', '')
                 _entity = username
+
         elif isinstance(entity, MessageEntityMention):
             _entity = text
 
         if _entity:
             try:
-                channel = (await client.get_cached_entity(_entity)).id
+                full_entity = await client.get_cached_entity(_entity)
+                if full_entity:
+                    channel = full_entity.id
+                    profile_photo = await client.download_profile_photo(full_entity, bytes)
+                    try:
+                        photo_hash = await hash_photo(profile_photo)
+                        for mhash in mhash_blacklist:
+                            if hashes_are_similar(mhash, photo_hash, tolerance=2):
+                                return db.ab_mhash_blacklist.hex_type, mhash_blacklist[mhash]
+                    except UnidentifiedImageError:
+                        pass
+
             except constants.GET_ENTITY_ERRORS as err:
                 logger.error(err)
 
-        if domain and domain in domain_blacklist:
-            return db.ab_domain_blacklist.hex_type, domain_blacklist[domain]
-        if face_domain and face_domain in domain_blacklist:
-            return db.ab_domain_blacklist.hex_type, domain_blacklist[face_domain]
+        # urllib doesnt like urls without a protocol
+        if not face_domain:
+            face_domain = await helpers.netloc(f'http://{domain}')
+
+        if domain:
+            if domain in domain_blacklist:
+                return db.ab_domain_blacklist.hex_type, domain_blacklist[domain]
+            # else:
+            # tld_index = await _check_tld(domain, tld_blacklist)
+            # if tld_index:
+            #     return db.ab_tld_blacklist.hex_type, tld_index
+
+        if face_domain:
+            if face_domain in domain_blacklist:
+                return db.ab_domain_blacklist.hex_type, domain_blacklist[face_domain]
+            # else:
+            # tld_index = await _check_tld(face_domain, tld_blacklist)
+            # if tld_index:
+            #     return db.ab_tld_blacklist.hex_type, tld_index
+
         if channel and channel in channel_blacklist:
             return db.ab_channel_blacklist.hex_type, channel_blacklist[channel]
 
@@ -241,3 +289,10 @@ async def _check_message(event):
                 return db.ab_mhash_blacklist.hex_type, mhash_blacklist[mhash]
 
     return False, False
+
+# async def _check_tld(domain, tld_blacklist):
+#     domain, tld = domain.split('.')
+#     if tld in tld_blacklist and domain != 'nic':
+#         return tld_blacklist[tld]
+#     else:
+#         return False

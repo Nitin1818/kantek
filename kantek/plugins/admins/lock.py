@@ -1,26 +1,27 @@
 """Plugin to manage the autobahn"""
 import logging
 
-from telethon import events
 from telethon.errors import ChatNotModifiedError
-from telethon.events import NewMessage
-from telethon.tl.custom import Message
 from telethon.tl.functions.messages import EditChatDefaultBannedRightsRequest
-from telethon.tl.types import ChannelParticipantsAdmins, ChatBannedRights, InputPeerChannel
+from telethon.tl.types import ChatBannedRights, InputPeerChannel
 
-from config import cmd_prefix
-from utils.client import KantekClient
-from utils.mdtex import MDTeXDocument
-
-__version__ = '0.1.0'
+from utils.client import Client
+from utils.mdtex import *
+from utils.pluginmgr import k, Command
 
 tlog = logging.getLogger('kantek-channel-log')
 
 
-@events.register(events.NewMessage(outgoing=True, pattern=f'{cmd_prefix}lock'))
-async def lock(event: NewMessage.Event) -> None:
-    """Command to quickly lock a chat to readonly for normal users."""
-    client: KantekClient = event.client
+@k.command('lock', admins=True)
+async def lock(client: Client, event: Command) -> MDTeXDocument:
+    """Set a chat to read only.
+
+    Arguments:
+        `-self`: Use to make other Kantek instances ignore your command
+
+    Examples:
+        {cmd}
+    """
     chat: InputPeerChannel = await event.get_input_chat()
     try:
         await client(EditChatDefaultBannedRightsRequest(
@@ -39,19 +40,6 @@ async def lock(event: NewMessage.Event) -> None:
                 invite_users=True,
                 pin_messages=True
             )))
-        await client.respond(event, MDTeXDocument('Chat locked.'))
+        return MDTeXDocument('Chat locked.')
     except ChatNotModifiedError:
-        await client.respond(event, MDTeXDocument('Chat already locked.'))
-
-
-@events.register(events.NewMessage(incoming=True, pattern=f'{cmd_prefix}lock'))
-async def cleanup_group_admins(event: NewMessage.Event) -> None:
-    """Check if the issuer of the command is group admin. Then execute the cleanup command."""
-    if event.is_channel:
-        msg: Message = event.message
-        client: KantekClient = event.client
-        async for p in client.iter_participants(event.chat_id, filter=ChannelParticipantsAdmins):
-            if msg.from_id == p.id:
-                await lock(event)
-                tlog.info(f'lock executed by [{p.id}](tg://user?id={p.id}) in `{(await event.get_chat()).title}`')
-                break
+        return MDTeXDocument('Chat already locked.')

@@ -1,92 +1,74 @@
 """Plugin to handle tagging of chats and channels."""
 import logging
-from typing import Dict, List
+from typing import Dict
 
-from telethon import events
-from telethon.events import NewMessage
-from telethon.tl.custom import Message
-from telethon.tl.types import Chat, Message
+from telethon.tl.types import Channel
 
-from config import cmd_prefix
-from database.arango import ArangoDB
-from utils import parsers
-from utils.client import KantekClient
-from utils.mdtex import Bold, Code, Item, KeyValueItem, Section
-from utils.tagmgr import TagManager
-
-__version__ = '0.1.0'
+from utils.mdtex import *
+from utils.pluginmgr import k
+from utils.tags import Tags
 
 tlog = logging.getLogger('kantek-channel-log')
 
 
-@events.register(events.NewMessage(outgoing=True, pattern=f'{cmd_prefix}tag'))
-async def tag(event: NewMessage.Event) -> None:
-    """Add or remove tags from groups and channels.
+@k.command('tag')
+async def tag(chat: Channel, tags: Tags) -> MDTeXDocument:
+    """Add, query or remove tags from groups and channels.
 
-    Args:
-        event: The event of the command
+    Tags are used by various plugins to alter their functionality in the specific chats.
+    Check each plugins help to see which tags are accepted.
+    To list the tags of the current chat simply specify no subcommands
 
-    Returns: None
-
+    Examples:
+        {cmd}
     """
-    chat: Chat = event.chat
-    client: KantekClient = event.client
-    db: ArangoDB = client.db
-    msg: Message = event.message
-    tag_mgr = TagManager(event)
-    args = msg.raw_text.split()[1:]
-    response = ''
-    if not args:
-        named_tags: Dict = tag_mgr.named_tags
-        tags: List = tag_mgr.tags
-        data = []
-        data += [KeyValueItem(Bold(key), value) for key, value in named_tags.items()]
-        data += [Item(_tag) for _tag in tags]
-        if not data:
-            data.append(Code('None'))
-        response = Section(Item(f'Tags for {Bold(chat.title)}[{Code(event.chat_id)}]:'),
-                           *data)
-    elif args[0] == 'add' and len(args) > 1:
-        await _add_tags(event)
-    elif args[0] == 'clear':
-        tag_mgr.clear()
-    elif args[0] == 'del' and len(args) > 1:
-        await _delete_tags(event)
-    if not response:
-        await msg.delete()
-    else:
-        await client.respond(event, response)
+    named_tags: Dict = tags.named_tags
+    data = []
+    data += [KeyValueItem(Bold(key), value) for key, value in named_tags.items()]
+    if not data:
+        data.append(Code('None'))
+    return MDTeXDocument(
+        Section(Item(f'Tags for {chat.title}[{Code(chat.id)}]:'),
+                *data)
+    )
 
 
-async def _add_tags(event: NewMessage.Event):
-    """Add tags to chat.
+@tag.subcommand()
+async def add(args, kwargs, tags, event) -> None:
+    """Add tags to the chat.
+    Both positional and keyword argument are supported
 
-    Args:
-        event: The event of the command
-
-    Returns: A string with the action taken.
+    **Examples:**
+        {cmd} -strafanzeige polizei: exclude
+        {cmd} gban: verbose
     """
-    msg: Message = event.message
-    args = msg.raw_text.split()[2:]
-    tag_mgr = TagManager(event)
-    named_tags, tags = parsers.parse_arguments(' '.join(args))
-    for name, value in named_tags.items():
-        tag_mgr[name] = value
-    for _tag in tags:
-        tag_mgr.set_tag(_tag)
+    for name, value in kwargs.items():
+        tags[name] = value
+    await event.delete()
 
 
-async def _delete_tags(event: NewMessage.Event):
-    """Delete the specified tags from a chat.
+@tag.subcommand()
+async def del_(args, tags, event) -> None:
+    """Delete the specified tags from the chat.
 
-    Args:
-        event: The event of the command
+    Arguments:
+        `keys`: Tags to delete
 
-    Returns: A string with the action taken.
+    **Examples:**
+        {cmd} gban polizei
+        {cmd} network
     """
-    msg: Message = event.message
-    tag_mgr = TagManager(event)
-    args = msg.raw_text.split()[2:]
-    _, args = parsers.parse_arguments(' '.join(args))
     for arg in args:
-        del tag_mgr[arg]
+        del tags[arg]
+    await event.delete()
+
+
+@tag.subcommand()
+async def clear(tags: Tags, event) -> None:
+    """Clear all tags from the chat.
+
+    **Examples:**
+        {cmd}
+    """
+    tags.clear()
+    await event.delete()

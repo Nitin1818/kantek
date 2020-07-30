@@ -1,41 +1,43 @@
 """Plugin to remove deleted Accounts from a group"""
 import asyncio
-import datetime
 import logging
-from typing import Optional
+from typing import Optional, Dict
 
 import logzero
-from telethon import events
-from telethon.errors import FloodWaitError, UserAdminInvalidError
-from telethon.events import NewMessage
+from telethon.errors import FloodWaitError, UserAdminInvalidError, MessageIdInvalidError
 from telethon.tl.custom import Message
-from telethon.tl.functions.channels import EditBannedRequest
-from telethon.tl.types import (Channel, ChannelParticipantsAdmins, ChatBannedRights, User)
+from telethon.tl.types import (Channel, User)
 
-from config import cmd_prefix
-from utils import helpers
-from utils.client import KantekClient
-from utils.mdtex import Bold, KeyValueItem, MDTeXDocument, Section
-
-__version__ = '0.3.0'
+from utils.client import Client
+from utils.mdtex import *
+from utils.pluginmgr import k, Command
 
 tlog = logging.getLogger('kantek-channel-log')
 logger: logging.Logger = logzero.logger
 
 
-@events.register(events.NewMessage(outgoing=True, pattern=f'{cmd_prefix}cleanup'))
-async def cleanup(event: NewMessage.Event) -> None:
-    """Command to remove Deleted Accounts from a group or network."""
-    chat: Channel = await event.get_chat()
-    client: KantekClient = event.client
-    keyword_args, _ = await helpers.get_args(event)
-    count_only = keyword_args.get('count', False)
-    silent = keyword_args.get('silent', False)
+@k.command('cleanup', admins=True)
+async def cleanup(client: Client, chat: Channel, msg: Message,
+                  kwargs: Dict, event: Command) -> None:
+    """Remove or count all "Deleted Accounts" in a group.
+
+    Arguments:
+        `-count`: Only count deleted accounts and don't remove them
+        `-silent`: Don't send a progress message
+        `-self`: Use to make other Kantek instances ignore your command
+
+    Examples:
+        {cmd}
+        {cmd} -count
+        {cmd} -silent
+    """
+    count_only = kwargs.get('count', False)
+    silent = kwargs.get('silent', False)
     if not chat.creator and not chat.admin_rights:
         count_only = True
     waiting_message = None
     if silent:
-        await event.message.delete()
+        await msg.delete()
     else:
         waiting_message = await client.respond(event, 'Starting cleanup. This might take a while.')
     response = await _cleanup_chat(event, count=count_only, progress_message=waiting_message)
@@ -45,23 +47,10 @@ async def cleanup(event: NewMessage.Event) -> None:
         await waiting_message.delete()
 
 
-@events.register(events.NewMessage(incoming=True, pattern=f'{cmd_prefix}cleanup'))
-async def cleanup_group_admins(event: NewMessage.Event) -> None:
-    """Check if the issuer of the command is group admin. Then execute the cleanup command."""
-    if event.is_channel:
-        msg: Message = event.message
-        client: KantekClient = event.client
-        async for p in client.iter_participants(event.chat_id, filter=ChannelParticipantsAdmins):
-            if msg.from_id == p.id:
-                await cleanup(event)
-                tlog.info(f'cleanup executed by [{p.id}](tg://user?id={p.id}) in `{(await event.get_chat()).title}`')
-                break
-
-
 async def _cleanup_chat(event, count: bool = False,
                         progress_message: Optional[Message] = None) -> MDTeXDocument:
     chat: Channel = await event.get_chat()
-    client: KantekClient = event.client
+    client: Client = event.client
     user: User
     deleted_users = 0
     deleted_admins = 0
@@ -72,27 +61,25 @@ async def _cleanup_chat(event, count: bool = False,
     modulus = (participant_count // 25) or 1
     async for user in client.iter_participants(chat):
         if progress_message is not None and user_counter % modulus == 0:
-            progress = Section(Bold('Cleanup'),
+            progress = Section('Cleanup',
                                KeyValueItem(Bold('Progress'),
                                             f'{user_counter}/{participant_count}'),
                                KeyValueItem(deleted_accounts_label, deleted_users))
-            await progress_message.edit(str(progress))
+            try:
+                await progress_message.edit(str(progress))
+            except MessageIdInvalidError:
+                progress_message = None
         user_counter += 1
         if user.deleted:
             deleted_users += 1
             if not count:
                 try:
-                    await client(EditBannedRequest(
-                        chat, user, ChatBannedRights(
-                            until_date=datetime.datetime(2038, 1, 1),
-                            view_messages=True
-                        )
-                    ))
+                    await client.ban(chat, user)
                 except UserAdminInvalidError:
                     deleted_admins += 1
                 except FloodWaitError as error:
                     if progress_message is not None:
-                        progress = Section(Bold('Cleanup | FloodWait'),
+                        progress = Section('Cleanup | FloodWait',
                                            Bold(f'Got FloodWait for {error.seconds}s. Sleeping.'),
                                            KeyValueItem(Bold('Progress'),
                                                         f'{user_counter}/{participant_count}'),
@@ -102,14 +89,9 @@ async def _cleanup_chat(event, count: bool = False,
                     tlog.error(error)
                     logger.error(error)
                     await asyncio.sleep(error.seconds)
-                    await client(EditBannedRequest(
-                        chat, user, ChatBannedRights(
-                            until_date=datetime.datetime(2038, 1, 1),
-                            view_messages=True
-                        )
-                    ))
+                    await client.ban(chat, user)
 
     return MDTeXDocument(
-        Section(Bold('Cleanup'),
+        Section('Cleanup',
                 KeyValueItem(deleted_accounts_label, deleted_users),
                 KeyValueItem(Bold('Deleted Admins'), deleted_admins) if deleted_admins else None))

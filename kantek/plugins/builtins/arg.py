@@ -1,47 +1,45 @@
 """Plugin to test the argument parser"""
 import logging
 from pprint import pformat
+from typing import Dict, List
 
-from telethon import events
-from telethon.events import NewMessage
 from telethon.tl.custom import Message
 
-from config import cmd_prefix
-from utils import parsers
-from utils.mdtex import Bold, Code, KeyValueItem, MDTeXDocument, Section, SubSection, Pre
-
-__version__ = '0.1.0'
+from utils.mdtex import *
+from utils.pluginmgr import k
 
 tlog = logging.getLogger('kantek-channel-log')
 
 
-@events.register(events.NewMessage(outgoing=True, pattern=f'{cmd_prefix}arg'))
-async def show_args(event: NewMessage.Event) -> None:
+@k.command('arg')
+async def show_args(msg: Message, args: List, kwargs: Dict) -> MDTeXDocument:
     """Show the raw output of the argument parser
 
-    Args:
-        event: The event of the command
-
-    Returns: None
+    Examples:
+        {cmd} arg1 arg2 arg3
+        {cmd} arg1: val1 arg2: "val2.1 val2.2"
+        {cmd} arg: [123, 456] arg2: ["abc", "de f", "xyz"]
+        {cmd} arg: 1..10 arg2: -5..5 arg2: -10..0
+        {cmd} 1e4 2.5e4 125e-5
+        {cmd} 3+3j 4+2i
+        {cmd} keyword: 1 keyword2: 5
+        {cmd} posarg -flag
+        {cmd} posarg -flag 125e-5
 
     """
-    msg: Message = event.message
-    _args = msg.raw_text.split()[1:]
-    keyword_args, args = parsers.parse_arguments(' '.join(_args))
     _args = []
     for arg in args:
         _args.append(SubSection(Code(arg),
                                 KeyValueItem('type', Code(type(arg).__name__))))
-    kwargs = []
-    for k, v in keyword_args.items():
-        kwargs.append(SubSection(Code(k),
-                                 KeyValueItem('value', Code(v)),
-                                 KeyValueItem('type', Code(type(v).__name__))))
-    doc = MDTeXDocument(
-        Section(Bold('Args'), *_args),
-        Section(Bold('Keyword Args'), *kwargs),
-        Section(Bold('Raw'),
+    keyword_args = []
+    for key, value in kwargs.items():
+        keyword_args.append(SubSection(Code(key),
+                                       KeyValueItem('value', Code(value)),
+                                       KeyValueItem('type', Code(type(value).__name__))))
+    return MDTeXDocument(
+        Section('Args', *_args),
+        Section('Keyword Args', *keyword_args),
+        Section('Raw',
                 KeyValueItem('args', Pre(pformat(args, width=30))),
-                KeyValueItem('keyword_args', Pre(pformat(keyword_args, width=30))))
+                KeyValueItem('keyword_args', Pre(pformat(kwargs, width=30))))
     )
-    await msg.reply(str(doc))

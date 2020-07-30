@@ -1,30 +1,52 @@
 """Plugin to manage the autobahn"""
 import logging
-from typing import Dict, Union
+from typing import Union
 
 import logzero
 from telethon import events
 from telethon.errors import UserIdInvalidError
 from telethon.events import ChatAction, NewMessage
-from telethon.tl.types import Channel, ChannelParticipantsAdmins
+from telethon.tl.types import (Channel, ChannelParticipantsAdmins, MessageActionChatJoinedByLink,
+                               MessageActionChatAddUser)
 
 from database.arango import ArangoDB
-from utils.client import KantekClient
-from utils.mdtex import Bold, Code, KeyValueItem, MDTeXDocument, Mention, Section
-
-__version__ = '0.1.1'
+from utils.client import Client
+from utils.mdtex import *
+from utils.pluginmgr import k
+from utils.tags import Tags
 
 tlog = logging.getLogger('kantek-channel-log')
 logger: logging.Logger = logzero.logger
 
 
-@events.register(events.chataction.ChatAction())
-@events.register(events.NewMessage())
-async def grenzschutz(event: Union[ChatAction.Event, NewMessage.Event]) -> None:
-    """Plugin to ban blacklisted users."""
+@k.event(events.chataction.ChatAction())
+@k.event(events.NewMessage(), name='grenzschutz')
+async def grenzschutz(event: Union[ChatAction.Event, NewMessage.Event]) -> None:  # pylint: disable = R0911
+    """Automatically ban gbanned users.
+
+    This plugin will ban gbanned users upon joining,getting added to the group or when writing a message. A message will be sent to notify Users of the action, this message will be deleted after 5 minutes.
+
+    Tags:
+        polizei:
+            exclude: Don't ban gbanned users
+        grenschutz:
+            silent: Don't send the notification message
+            exclude: Don't ban gbanned users
+    """
     if event.is_private:
         return
-    client: KantekClient = event.client
+
+    if isinstance(event, ChatAction.Event):
+        if event.user_left or event.user_kicked:
+            return
+
+    if isinstance(event, ChatAction.Event):
+        if event.action_message is None:
+            return
+        elif not isinstance(event.action_message.action,
+                            (MessageActionChatJoinedByLink, MessageActionChatAddUser)):
+            return
+    client: Client = event.client
     chat: Channel = await event.get_chat()
     if not chat.creator and not chat.admin_rights:
         return
@@ -32,10 +54,9 @@ async def grenzschutz(event: Union[ChatAction.Event, NewMessage.Event]) -> None:
         if not chat.admin_rights.ban_users:
             return
     db: ArangoDB = client.db
-    chat_document = db.groups.get_chat(event.chat_id)
-    db_named_tags: Dict = chat_document['named_tags'].getStore()
-    polizei_tag = db_named_tags.get('polizei')
-    grenzschutz_tag = db_named_tags.get('grenzschutz')
+    tags = Tags(event)
+    polizei_tag = tags.get('polizei')
+    grenzschutz_tag = tags.get('grenzschutz')
     silent = grenzschutz_tag == 'silent'
     if grenzschutz_tag == 'exclude' or polizei_tag == 'exclude':
         return
@@ -60,14 +81,14 @@ async def grenzschutz(event: Union[ChatAction.Event, NewMessage.Event]) -> None:
         return
     else:
         ban_reason = result[0]['reason']
-    admins = [p.id for p in (await client.get_participants(event.chat_id, filter=ChannelParticipantsAdmins()))]
+    admins = [p.id for p in await client.get_participants(event.chat_id, filter=ChannelParticipantsAdmins())]
     if uid not in admins:
         try:
             await client.ban(chat, uid)
         except UserIdInvalidError as err:
-            logger.error(f"Error occured while banning {err}")
+            logger.error("Error occured while banning %s", err)
             return
-
+        await event.delete()
         if not silent:
             message = MDTeXDocument(Section(
                 Bold('SpamWatch Grenzschutz Ban'),
@@ -76,4 +97,4 @@ async def grenzschutz(event: Union[ChatAction.Event, NewMessage.Event]) -> None:
                 KeyValueItem(Bold("Reason"),
                              ban_reason)
             ))
-            await client.send_message(chat, str(message))
+            await client.respond(event, str(message), reply=False, delete=120)
